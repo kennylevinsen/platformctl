@@ -1,0 +1,19 @@
+[package]
+name = "platformctl"
+version = "0.1.0"
+authors = ["Kenny Levinsen <kl@kl.wtf>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = "1.0"
+chrono = "0.4"
+libpulse-binding = { version = "2.6.0"}
+dbus = "0.6"
+clap = "2.33"
+
+[[bin]]
+name = "platformctl"
+path = "src/bin/platformctl.rs"
+
