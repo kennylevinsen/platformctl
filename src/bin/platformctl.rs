@@ -39,6 +39,11 @@ fn main() {
                             .help("Value to add to sound volume")
                             .index(1),
                     )
+                    .arg(
+                        Arg::with_name("max")
+                            .help("Max value to cap volume to")
+                            .index(2),
+                    )
                 )
                 .subcommand(SubCommand::with_name("mute")
                     .arg(
@@ -124,7 +129,19 @@ fn main() {
                                 }
                                 Ok(v) => v,
                             };
-                            match p.add_volume(step) {
+                            let cap: Option<f32> = match val.value_of_lossy("max") {
+                                None => None,
+                                Some(v) => {
+                                    match v.parse::<f32>() {
+                                        Err(e) => {
+                                            eprintln!("unable to parse max: {:}", e);
+                                            std::process::exit(1);
+                                        }
+                                        Ok(v) => Some(v)
+                                    }
+                                },
+                            };
+                            match p.add_volume(step, cap) {
                                 Err(e) => {
                                     eprintln!("unable to add volume: {:}", e);
                                     std::process::exit(3);
