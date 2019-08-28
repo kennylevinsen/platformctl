@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -15,7 +14,7 @@ use libpulse_binding::context::{
 use libpulse_binding::mainloop::standard::IterateResult;
 use libpulse_binding::mainloop::standard::Mainloop;
 use libpulse_binding::proplist::{properties, Proplist};
-use libpulse_binding::volume::{ChannelVolumes, VOLUME_MAX, VOLUME_NORM};
+use libpulse_binding::volume::{ChannelVolumes, Volume, VOLUME_NORM};
 
 struct PulseAudioConnection {
     mainloop: Rc<RefCell<Mainloop>>,
@@ -55,7 +54,7 @@ impl PulseAudioConnection {
     fn new() -> Result<Self, ::std::io::Error> {
         let mut proplist = Proplist::new().unwrap();
         proplist
-            .sets(properties::APPLICATION_NAME, "wldash")
+            .set_str(properties::APPLICATION_NAME, "platformctl")
             .unwrap();
 
         let mainloop = Rc::new(RefCell::new(Mainloop::new().unwrap()));
@@ -364,8 +363,10 @@ impl PulseAudioSoundDevice {
 
         // apply step to volumes
         let step = (step * VOLUME_NORM.0 as f32).round() as i32;
-        for vol in volume.values.iter_mut() {
-            vol.0 = min(max(0, vol.0 as i32 + step) as u32, VOLUME_MAX.0);
+        if step > 0 {
+            volume.increase(Volume(step as u32));
+        } else {
+            volume.decrease(Volume(-step as u32));
         }
 
         // update volumes
