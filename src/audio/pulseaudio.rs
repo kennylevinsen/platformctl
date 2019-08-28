@@ -350,7 +350,7 @@ impl PulseAudioSoundDevice {
         Ok(())
     }
 
-    fn add_volume(&mut self, step: f32) -> Result<(), ::std::io::Error> {
+    fn add_volume(&mut self, step: f32, cap: Option<f32>) -> Result<(), ::std::io::Error> {
         let mut volume = match self.volume {
             Some(volume) => volume,
             None => {
@@ -364,7 +364,12 @@ impl PulseAudioSoundDevice {
         // apply step to volumes
         let step = (step * VOLUME_NORM.0 as f32).round() as i32;
         if step > 0 {
-            volume.increase(Volume(step as u32));
+            if let Some(cap) = cap {
+                let cap = (cap * VOLUME_NORM.0 as f32).round() as u32;
+                volume.inc_clamp(Volume(step as u32), Volume(cap));
+            } else {
+                volume.increase(Volume(step as u32));
+            }
         } else {
             volume.decrease(Volume(-step as u32));
         }
@@ -430,8 +435,8 @@ impl PulseAudio {
         self.device.lock().unwrap().muted()
     }
 
-    pub fn add_volume(&self, increment: f32) -> Result<(), ::std::io::Error> {
-        self.device.lock().unwrap().add_volume(increment)
+    pub fn add_volume(&self, increment: f32, cap: Option<f32>) -> Result<(), ::std::io::Error> {
+        self.device.lock().unwrap().add_volume(increment, cap)
     }
 
     pub fn set_muted(&self, muted: bool) -> Result<(), ::std::io::Error> {
