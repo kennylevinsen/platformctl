@@ -1,4 +1,4 @@
-use clap::{crate_authors, crate_version, App, Arg, SubCommand};
+use clap::{crate_authors, crate_version, App, Arg, SubCommand, AppSettings};
 
 use platformctl::audio::pulseaudio::PulseAudioSoundDevice;
 use platformctl::backlight::Backlight;
@@ -34,6 +34,7 @@ fn main() {
             SubCommand::with_name("audio")
                 .about("Control audio devices")
                 .subcommand(SubCommand::with_name("volume")
+                    .setting(AppSettings::AllowLeadingHyphen)
                     .arg(
                         Arg::with_name("add")
                             .help("Value to add to sound volume")
