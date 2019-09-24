@@ -31,7 +31,6 @@ struct PulseAudioClient {
     sender: Sender<PulseAudioClientRequest>,
     default_sink: String,
     sinks: HashMap<String, PulseAudioSinkInfo>,
-    listener: Option<Sender<bool>>,
 }
 
 enum PulseAudioClientRequest {
@@ -42,12 +41,19 @@ enum PulseAudioClientRequest {
     SetSinkMuteByName(Option<Sender<bool>>, String, bool),
 }
 
-struct PulseAudioSoundDevice {
-    client: Arc<Mutex<PulseAudioClient>>,
+#[derive(Debug)]
+struct PulseAudioSoundDeviceInner {
     name: Option<String>,
     volume: Option<ChannelVolumes>,
     volume_avg: f32,
     muted: bool,
+    default_sink: String
+}
+
+pub struct PulseAudioSoundDevice {
+    client: Arc<Mutex<PulseAudioClient>>,
+    inner: Arc<Mutex<PulseAudioSoundDeviceInner>>,
+    block: bool,
 }
 
 impl PulseAudioConnection {
@@ -60,7 +66,7 @@ impl PulseAudioConnection {
         let mainloop = Rc::new(RefCell::new(Mainloop::new().unwrap()));
 
         let context = Rc::new(RefCell::new(
-            Context::new_with_proplist(mainloop.borrow().deref(), "wldash_context", &proplist)
+            Context::new_with_proplist(mainloop.borrow().deref(), "platformctl_context", &proplist)
                 .unwrap(),
         ));
 
@@ -103,122 +109,143 @@ impl PulseAudioConnection {
 }
 
 impl PulseAudioClient {
-    fn new(listener: Option<Sender<bool>>) -> Result<Arc<Mutex<Self>>, ::std::io::Error> {
+    fn new<F>(listener: F) -> Result<Arc<Mutex<Self>>, ::std::io::Error>
+    where
+        F: Fn(Arc<Mutex<Self>>) -> (),
+        F: Send + 'static + Clone,
+    {
         let (tx, rx) = channel();
 
         let client = Arc::new(Mutex::new(PulseAudioClient {
             sender: tx,
             default_sink: "@DEFAULT_SINK@".to_string(),
             sinks: HashMap::new(),
-            listener: listener,
         }));
 
-        let cl1 = client.clone();
+        let loop_client = client.clone();
         let (tx1, rx1) = channel();
-        thread::spawn(move || {
-            let mut conn = match PulseAudioConnection::new() {
-                Ok(v) => {
-                    tx1.send(true).unwrap();
-                    v
+        let _ = thread::Builder::new()
+            .name("pa_writer".to_string())
+            .spawn(move || {
+                let mut conn = match PulseAudioConnection::new() {
+                    Ok(v) => {
+                        tx1.send(true).unwrap();
+                        v
+                    }
+                    Err(_) => {
+                        tx1.send(false).unwrap();
+                        return;
+                    }
+                };
+
+                // make sure mainloop dispatched everything
+                for _ in 0..10 {
+                    conn.iterate(false).unwrap();
                 }
-                Err(_) => {
-                    tx1.send(false).unwrap();
-                    return;
-                }
-            };
 
-            // make sure mainloop dispatched everything
-            for _ in 0..10 {
-                conn.iterate(false).unwrap();
-            }
+                loop {
+                    let cl = loop_client.clone();
+                    let l = listener.clone();
+                    match rx.recv() {
+                        Err(_) => return,
+                        Ok(req) => {
+                            let mut introspector = conn.context.borrow_mut().introspect();
 
-            loop {
-                let cl11 = cl1.clone();
-                let cl12 = cl1.clone();
-                let cl13 = cl1.clone();
-                match rx.recv() {
-                    Err(_) => return,
-                    Ok(req) => {
-                        let mut introspector = conn.context.borrow_mut().introspect();
-
-                        match req {
-                            PulseAudioClientRequest::GetDefaultDevice(s) => {
-                                introspector.get_server_info(move |info| {
-                                    let _res = cl11.lock().unwrap().server_info_callback(info);
-                                    if let Some(s) = &s {
-                                        let _ = s.send(true);
-                                    }
-                                });
-                            }
-                            PulseAudioClientRequest::GetSinkInfoByIndex(s, index) => {
-                                introspector.get_sink_info_by_index(index, move |res| {
-                                    cl12.lock().unwrap().sink_info_callback(res);
-                                    if let Some(s) = &s {
-                                        let _ = s.send(true);
-                                    }
-                                });
-                            }
-                            PulseAudioClientRequest::GetSinkInfoByName(s, name) => {
-                                introspector.get_sink_info_by_name(&name, move |res| {
-                                    cl13.lock().unwrap().sink_info_callback(res);
-                                    if let Some(s) = &s {
-                                        let _ = s.send(true);
-                                    }
-                                });
-                            }
-                            PulseAudioClientRequest::SetSinkVolumeByName(s, name, volumes) => {
-                                introspector.set_sink_volume_by_name(&name, &volumes, None);
-                                if let Some(s) = &s {
-                                    let _ = s.send(true);
+                            match req {
+                                PulseAudioClientRequest::GetDefaultDevice(s) => {
+                                    introspector.get_server_info(move |info| {
+                                        let _res = PulseAudioClient::server_info_callback(
+                                            cl.clone(),
+                                            l.clone(),
+                                            info,
+                                        );
+                                        if let Some(s) = &s {
+                                            let _ = s.send(true);
+                                        }
+                                    });
                                 }
-                            }
-                            PulseAudioClientRequest::SetSinkMuteByName(s, name, mute) => {
-                                introspector.set_sink_mute_by_name(&name, mute, None);
-                                if let Some(s) = &s {
-                                    let _ = s.send(true);
+                                PulseAudioClientRequest::GetSinkInfoByIndex(s, index) => {
+                                    introspector.get_sink_info_by_index(index, move |res| {
+                                        PulseAudioClient::sink_info_callback(
+                                            cl.clone(),
+                                            l.clone(),
+                                            res,
+                                        );
+                                        if let Some(s) = &s {
+                                            let _ = s.send(true);
+                                        }
+                                    });
                                 }
-                            }
-                        };
+                                PulseAudioClientRequest::GetSinkInfoByName(s, name) => {
+                                    introspector.get_sink_info_by_name(&name, move |res| {
+                                        PulseAudioClient::sink_info_callback(
+                                            cl.clone(),
+                                            l.clone(),
+                                            res,
+                                        );
+                                        if let Some(s) = &s {
+                                            let _ = s.send(true);
+                                        }
+                                    });
+                                }
+                                PulseAudioClientRequest::SetSinkVolumeByName(s, name, volumes) => {
+                                    introspector.set_sink_volume_by_name(&name, &volumes, None);
+                                    if let Some(s) = &s {
+                                        let _ = s.send(true);
+                                    }
+                                }
+                                PulseAudioClientRequest::SetSinkMuteByName(s, name, mute) => {
+                                    introspector.set_sink_mute_by_name(&name, mute, None);
+                                    if let Some(s) = &s {
+                                        let _ = s.send(true);
+                                    }
+                                }
+                            };
 
-                        // send request and receive response
-                        conn.iterate(true).unwrap();
-                        conn.iterate(true).unwrap();
+                            // send request and receive response
+                            conn.iterate(true).unwrap();
+                            conn.iterate(true).unwrap();
+                        }
                     }
                 }
-            }
-        });
+            });
 
         // subscribe
         let cl2 = client.clone();
         let (tx2, rx2) = channel();
-        thread::spawn(move || {
-            let conn = match PulseAudioConnection::new() {
-                Ok(v) => {
-                    tx2.send(true).unwrap();
-                    v
-                }
-                Err(_) => {
-                    tx2.send(false).unwrap();
-                    return;
-                }
-            };
-            // subcribe for events
-            conn.context
-                .borrow_mut()
-                .set_subscribe_callback(Some(Box::new(move |facility, operation, index| {
-                    cl2.lock()
-                        .unwrap()
-                        .subscribe_callback(facility, operation, index)
-                })));
-            conn.context.borrow_mut().subscribe(
-                subscription_masks::SERVER | subscription_masks::SINK,
-                |_| {},
-            );
+        let _ = thread::Builder::new()
+            .name("pa_reader".to_string())
+            .spawn(move || {
+                let conn = match PulseAudioConnection::new() {
+                    Ok(v) => {
+                        tx2.send(true).unwrap();
+                        v
+                    }
+                    Err(_) => {
+                        tx2.send(false).unwrap();
+                        return;
+                    }
+                };
+                // subcribe for events
+                conn.context
+                    .borrow_mut()
+                    .set_subscribe_callback(Some(Box::new(move |facility, operation, index| {
+                        cl2.lock()
+                            .unwrap()
+                            .subscribe_callback(facility, operation, index)
+                    })));
+                conn.context.borrow_mut().subscribe(
+                    subscription_masks::SERVER | subscription_masks::SINK,
+                    |_| {},
+                );
 
-            conn.mainloop.borrow_mut().run().unwrap();
-        });
+                conn.mainloop.borrow_mut().run().unwrap();
+            });
 
-        if !rx1.recv().unwrap() || !rx2.recv().unwrap() {
+        let pa_writer_res = rx1.recv().unwrap();
+        let pa_reader_res = rx2.recv().unwrap();
+
+        if !pa_writer_res || !pa_reader_res {
             return Err(::std::io::Error::new(
                 ::std::io::ErrorKind::Other,
                 "unable to start pulseaudio thread",
@@ -238,16 +265,25 @@ impl PulseAudioClient {
         res
     }
 
-    fn server_info_callback(&mut self, server_info: &ServerInfo) {
+    fn server_info_callback<F>(s: Arc<Mutex<Self>>, listener: F, server_info: &ServerInfo)
+    where
+        F: Fn(Arc<Mutex<Self>>) -> (),
+        F: Send + 'static,
+    {
         match server_info.default_sink_name.clone() {
             None => {}
             Some(default_sink) => {
-                self.default_sink = default_sink.into();
+                (*s.lock().unwrap()).default_sink = default_sink.into();
+                listener(s);
             }
         }
     }
 
-    fn sink_info_callback(&mut self, result: ListResult<&SinkInfo>) {
+    fn sink_info_callback<F>(s: Arc<Mutex<Self>>, listener: F, result: ListResult<&SinkInfo>)
+    where
+        F: Fn(Arc<Mutex<Self>>) -> (),
+        F: Send + 'static,
+    {
         match result {
             ListResult::End | ListResult::Error => {}
             ListResult::Item(sink_info) => match sink_info.name.clone() {
@@ -257,11 +293,8 @@ impl PulseAudioClient {
                         volume: sink_info.volume,
                         mute: sink_info.mute,
                     };
-                    self.sinks.insert(name.into(), info);
-                    match self.listener {
-                        Some(ref tx) => tx.send(true).unwrap(),
-                        None => (),
-                    }
+                    s.lock().unwrap().sinks.insert(name.into(), info);
+                    listener(s);
                 }
             },
         }
@@ -289,8 +322,39 @@ impl PulseAudioClient {
 }
 
 impl PulseAudioSoundDevice {
-    fn new(listener: Option<Sender<bool>>) -> Result<Arc<Mutex<Self>>, ::std::io::Error> {
-        let client = PulseAudioClient::new(listener)?;
+    pub fn new<F>(listener: F, block: bool) -> Result<Self, ::std::io::Error>
+    where
+        F: Fn() -> (),
+        F: Send + 'static + Clone,
+    {
+        let inner = Arc::new(Mutex::new(PulseAudioSoundDeviceInner {
+            name: None,
+            volume: None,
+            volume_avg: 0.0,
+            muted: false,
+            default_sink: "@DEFAULT_SINK@".to_string(),
+        }));
+
+        let cb_inner = inner.clone();
+        let client = PulseAudioClient::new(move |client| {
+            let mut inner = cb_inner.lock().unwrap();
+            inner.default_sink = client.lock().unwrap().default_sink.clone();
+            let name = inner
+                .name
+                .clone()
+                .unwrap_or_else(|| inner.default_sink.clone());
+            let sink_info = match client.lock().unwrap().sinks.get(&name) {
+                None => return,
+                Some(sink_info) => (*sink_info).clone(),
+            };
+
+            inner.volume = Some(sink_info.volume);
+            inner.volume_avg = sink_info.volume.avg().0 as f32 / VOLUME_NORM.0 as f32;
+            inner.muted = sink_info.mute;
+
+            listener();
+        })?;
+
         let cl = client.clone();
         let (tx, rx) = channel();
         {
@@ -302,56 +366,35 @@ impl PulseAudioSoundDevice {
             let cl = client.lock().unwrap();
             cl.default_sink.to_string()
         };
-        let device = Arc::new(Mutex::new(PulseAudioSoundDevice {
+        (*inner.lock().unwrap()).name = Some(name.clone());
+        let device = PulseAudioSoundDevice {
             client: cl,
-            name: Some(name.to_string()),
-            volume: None,
-            volume_avg: 0.0,
-            muted: false,
-        }));
+            inner: inner,
+            block,
+        };
         let (tx, rx) = channel();
         {
             let cl = client.lock().unwrap();
             cl.send(PulseAudioClientRequest::GetSinkInfoByName(Some(tx), name))?;
         }
         rx.recv().unwrap();
-        device.lock().unwrap().get_info()?;
 
         Ok(device)
     }
 
-    fn name(&self) -> String {
-        self.name
-            .clone()
-            .unwrap_or_else(|| self.client.lock().unwrap().default_sink.clone())
+    pub fn volume(&self) -> f32 {
+        let inner = self.inner.lock().unwrap();
+        inner.volume_avg
     }
 
-    fn update_volume(&mut self, volume: ChannelVolumes) {
-        self.volume = Some(volume);
-        self.volume_avg = volume.avg().0 as f32 / VOLUME_NORM.0 as f32;
+    pub fn muted(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.muted
     }
 
-    fn volume(&self) -> f32 {
-        self.volume_avg
-    }
-
-    fn muted(&self) -> bool {
-        self.muted
-    }
-
-    fn get_info(&mut self) -> Result<(), ::std::io::Error> {
-        let sink_info = match self.client.lock().unwrap().sinks.get(&self.name()) {
-            None => return Ok(()),
-            Some(sink_info) => (*sink_info).clone(),
-        };
-        self.update_volume(sink_info.volume);
-        self.muted = sink_info.mute;
-
-        Ok(())
-    }
-
-    fn add_volume(&mut self, step: f32, cap: Option<f32>) -> Result<(), ::std::io::Error> {
-        let mut volume = match self.volume {
+    pub fn add_volume(&mut self, step: f32, cap: Option<f32>) -> Result<(), ::std::io::Error> {
+       let mut inner = self.inner.lock().unwrap();
+        let mut volume = match inner.volume {
             Some(volume) => volume,
             None => {
                 return Err(::std::io::Error::new(
@@ -374,72 +417,107 @@ impl PulseAudioSoundDevice {
             volume.decrease(Volume(-step as u32));
         }
 
-        // update volumes
-        self.update_volume(volume);
-        self.client
-            .lock()
-            .unwrap()
-            .send(PulseAudioClientRequest::SetSinkVolumeByName(
-                None,
-                self.name(),
-                volume,
-            ))?;
+        let name = inner
+            .name
+            .clone()
+            .unwrap_or_else(|| inner.default_sink.clone());
 
+        // update volumes
+        inner.volume = Some(volume);
+        inner.volume_avg = volume.avg().0 as f32 / VOLUME_NORM.0 as f32;
+        if self.block {
+            let (tx, rx) = channel();
+            self.client
+                .lock()
+                .unwrap()
+                .send(PulseAudioClientRequest::SetSinkVolumeByName(
+                    Some(tx), name, volume,
+                ))?;
+            let _ = rx.recv().unwrap();
+        } else {
+            self.client
+                .lock()
+                .unwrap()
+                .send(PulseAudioClientRequest::SetSinkVolumeByName(
+                    None, name, volume,
+                ))?;
+        }
         Ok(())
     }
 
-    fn set_muted(&mut self, muted: bool) -> Result<(), ::std::io::Error> {
-        self.muted = muted;
+    pub fn set_volume(&mut self, val: f32) -> Result<(), ::std::io::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut volume = match inner.volume {
+            Some(volume) => volume,
+            None => {
+                return Err(::std::io::Error::new(
+                    ::std::io::ErrorKind::Other,
+                    "unable to set volume",
+                ))
+            }
+        };
+
+        // apply step to volumes
+        volume.scale(Volume((val * VOLUME_NORM.0 as f32).round() as u32));
+
+        let name = inner
+            .name
+            .clone()
+            .unwrap_or_else(|| inner.default_sink.clone());
+
+        // update volumes
+        inner.volume = Some(volume);
+        inner.volume_avg = volume.avg().0 as f32 / VOLUME_NORM.0 as f32;
+        if self.block {
+            let (tx, rx) = channel();
+            self.client
+                .lock()
+                .unwrap()
+                .send(PulseAudioClientRequest::SetSinkVolumeByName(
+                    Some(tx), name, volume,
+                ))?;
+            let _ = rx.recv().unwrap();
+        } else {
+            self.client
+                .lock()
+                .unwrap()
+                .send(PulseAudioClientRequest::SetSinkVolumeByName(
+                    None, name, volume,
+                ))?;
+        }
+        Ok(())
+    }
+
+    pub fn set_muted(&mut self, muted: bool) -> Result<(), ::std::io::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.muted = muted;
+        if self.block {
+            let (tx, rx) = channel();
+        self.client
+            .lock()
+            .unwrap()
+            .send(PulseAudioClientRequest::SetSinkMuteByName(
+                Some(tx),
+                inner
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| inner.default_sink.clone()),
+                inner.muted,
+            ))?;
+            let _ = rx.recv().unwrap();
+        } else {
         self.client
             .lock()
             .unwrap()
             .send(PulseAudioClientRequest::SetSinkMuteByName(
                 None,
-                self.name(),
-                self.muted,
+                inner
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| inner.default_sink.clone()),
+                inner.muted,
             ))?;
-
-        Ok(())
-    }
-}
-
-pub struct PulseAudio {
-    device: Arc<Mutex<PulseAudioSoundDevice>>,
-}
-
-impl PulseAudio {
-    pub fn new(listener: Option<Sender<bool>>) -> Result<PulseAudio, ::std::io::Error> {
-        match listener {
-            Some(listener) => {
-                let (tx, rx) = channel();
-                let device = PulseAudioSoundDevice::new(Some(tx))?;
-                let d = device.clone();
-                std::thread::spawn(move || loop {
-                    rx.recv().unwrap();
-                    d.lock().unwrap().get_info().unwrap();
-                    listener.send(true).unwrap();
-                });
-                Ok(PulseAudio { device: device })
-            }
-            None => Ok(PulseAudio {
-                device: PulseAudioSoundDevice::new(None)?,
-            }),
         }
-    }
-
-    pub fn volume(&self) -> f32 {
-        self.device.lock().unwrap().volume()
-    }
-
-    pub fn muted(&self) -> bool {
-        self.device.lock().unwrap().muted()
-    }
-
-    pub fn add_volume(&self, increment: f32, cap: Option<f32>) -> Result<(), ::std::io::Error> {
-        self.device.lock().unwrap().add_volume(increment, cap)
-    }
-
-    pub fn set_muted(&self, muted: bool) -> Result<(), ::std::io::Error> {
-        self.device.lock().unwrap().set_muted(muted)
+        Ok(())
     }
 }

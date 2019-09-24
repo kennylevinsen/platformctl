@@ -1,6 +1,6 @@
 use clap::{crate_authors, crate_version, App, Arg, SubCommand};
 
-use platformctl::audio::pulseaudio::PulseAudio;
+use platformctl::audio::pulseaudio::PulseAudioSoundDevice;
 use platformctl::backlight::Backlight;
 
 fn parse_bool(value: &str, current: bool) -> bool {
@@ -92,7 +92,7 @@ fn main() {
             };
         }
         ("audio", Some(sub)) => {
-            let p = match PulseAudio::new(None) {
+            let mut p = match PulseAudioSoundDevice::new(|| {}, true) {
                 Err(_) => {
                     eprintln!("could not initialize an audio connector");
                     std::process::exit(2);
